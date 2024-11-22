@@ -4,17 +4,20 @@ use crate::executor::tokio::TokioExecutor;
 use crate::executor::BlockOnExecutor;
 use flume::{Receiver, Sender};
 use fusio::path::Path;
+use fusio_dispatch::FsOptions;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
-    update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor,
-    VTabKind, Values,
+    parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection,
+    VTabCursor, VTabKind, Values,
 };
 use rusqlite::{ffi, vtab, Connection, Error};
+use sqlparser::ast::{ColumnOption, DataType, Statement};
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
 use std::any::Any;
 use std::collections::Bound;
 use std::ffi::c_int;
-use std::fs;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::runtime::Builder;
@@ -24,7 +27,6 @@ use tonbo::record::{Column, ColumnDesc, DynRecord, Record};
 use tonbo::{DbOption, DB};
 
 pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
-    let _ = fs::create_dir_all("./db_path/tonbo");
     let runtime = Arc::new(
         Builder::new_multi_thread()
             .worker_threads(4)
@@ -52,86 +54,188 @@ pub struct TonboTable {
     column_desc: Vec<ColumnDesc>,
 }
 
+enum FsType {
+    Local,
+    S3,
+}
+
 impl TonboTable {
-    fn parse_type(input: &str) -> rusqlite::Result<(Datatype, bool, bool)> {
-        let input = input.trim();
-
-        let is_nullable = input.contains("nullable");
-        let is_primary_key = input.contains("primary key");
-
-        let mut type_str = input.to_string();
-        if is_nullable {
-            type_str = type_str.replace("nullable", "");
-        }
-        if is_primary_key {
-            type_str = type_str.replace("primary key", "");
-        }
-        let ty = match type_str.trim() {
-            "int" => Datatype::Int64,
-            "varchar" => Datatype::String,
-            _ => {
-                return Err(Error::ModuleError(format!(
-                    "unrecognized parameter '{input}'"
-                )));
-            }
-        };
-
-        Ok((ty, is_nullable, is_primary_key))
-    }
-
     fn connect_create(
         _: &mut VTabConnection,
         aux: Option<&Arc<DbState>>,
         args: &[&[u8]],
         _: bool,
     ) -> rusqlite::Result<(String, Self)> {
+        let dialect = MySqlDialect {};
         let mut primary_key_index = None;
         let mut descs = Vec::new();
-        let mut fields = Vec::with_capacity(args.len());
 
-        let mut i = 0;
-        for c_slice in args.iter() {
-            let Ok((param, value)) = vtab::parameter(c_slice) else {
-                continue;
-            };
-            let (ty, is_nullable, is_primary_key) = Self::parse_type(value)?;
+        let mut schema = None;
+        let mut fs_option = None;
+        // Local
+        let mut path = None;
+        // S3
+        let mut s3_url = None;
+        let mut bucket = None;
+        let mut key_id = None;
+        let mut secret_key = None;
+        let mut token = None;
+        let mut endpoint = None;
+        let mut region = None;
+        let mut sign_payload = None;
+        let mut checksum = None;
 
-            if is_primary_key {
-                if primary_key_index.is_some() {
-                    return Err(Error::ModuleError(
-                        "the primary key must exist and only one is allowed".to_string(),
-                    ));
+        let args = &args[3..];
+        for (i, c_slice) in args.iter().enumerate() {
+            let (param, value) = vtab::parameter(c_slice)?;
+            match param {
+                "create_sql" => {
+                    if schema.is_some() {
+                        return Err(Error::ModuleError("`create_sql` duplicate".to_string()));
+                    }
+                    schema = Some(value.to_string());
+                    if let Statement::CreateTable(create_table) =
+                        &Parser::parse_sql(&dialect, value)
+                            .map_err(|err| Error::ModuleError(err.to_string()))?[0]
+                    {
+                        for column_def in create_table.columns.iter() {
+                            let name = column_def.name.value.to_ascii_lowercase();
+                            let datatype = type_trans(&column_def.data_type);
+                            let mut is_not_nullable = column_def
+                                .options
+                                .iter()
+                                .any(|option| matches!(option.option, ColumnOption::NotNull));
+                            let is_primary_key = column_def.options.iter().any(|option| {
+                                matches!(
+                                    option.option,
+                                    ColumnOption::Unique {
+                                        is_primary: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            if is_primary_key {
+                                if primary_key_index.is_some() {
+                                    return Err(Error::ModuleError(
+                                        "the primary key must exist and only one is allowed"
+                                            .to_string(),
+                                    ));
+                                }
+                                is_not_nullable = true;
+                                primary_key_index = Some(i)
+                            }
+                            descs.push(ColumnDesc {
+                                datatype,
+                                is_nullable: !is_not_nullable,
+                                name,
+                            })
+                        }
+                    } else {
+                        return Err(Error::ModuleError(format!(
+                            "`CreateTable` SQL syntax error: '{value}'"
+                        )));
+                    }
                 }
-                primary_key_index = Some(i)
+                "fs" => match value {
+                    "local" => fs_option = Some(FsType::Local),
+                    "s3" => fs_option = Some(FsType::S3),
+                    _ => {
+                        return Err(Error::ModuleError(format!(
+                            "unrecognized fs type '{param}'"
+                        )))
+                    }
+                },
+                "s3_url" => s3_url = Some(value.to_string()),
+                "key_id" => key_id = Some(value.to_string()),
+                "secret_key" => secret_key = Some(value.to_string()),
+                "token" => token = Some(value.to_string()),
+                "bucket" => bucket = Some(value.to_string()),
+                "path" => path = Some(value.to_string()),
+                "endpoint" => endpoint = Some(value.to_string()),
+                "region" => region = Some(value.to_string()),
+                "sign_payload" => sign_payload = parse_boolean(value),
+                "checksum" => checksum = parse_boolean(value),
+                _ => {
+                    return Err(Error::ModuleError(format!(
+                        "unrecognized parameter '{param}'"
+                    )));
+                }
             }
-
-            fields.push(format!("{} {}", param, value));
-            descs.push(ColumnDesc::new(param.to_string(), ty, is_nullable));
-            i += 1;
         }
         let primary_key_index = primary_key_index.ok_or_else(|| {
             Error::ModuleError("the primary key must exist and only one is allowed".to_string())
         })?;
         if descs[primary_key_index].datatype != Datatype::Int64 {
             return Err(Error::ModuleError(
-                "the primary key must be of int type".to_string(),
+                "the primary key must be of `bigint` type".to_string(),
             ));
+        }
+        let path = Path::from_filesystem_path(
+            path.ok_or_else(|| Error::ModuleError("`path` not found".to_string()))?,
+        )
+        .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
+        let fs_option = match fs_option.unwrap_or(FsType::Local) {
+            FsType::Local => FsOptions::Local,
+            FsType::S3 => {
+                let mut credential = None;
+
+                if key_id.is_some() || secret_key.is_some() || token.is_some() {
+                    credential = Some(fusio::remotes::aws::AwsCredential {
+                        key_id: key_id
+                            .ok_or_else(|| Error::ModuleError("`key_id` not found".to_string()))?,
+                        secret_key: secret_key.ok_or_else(|| {
+                            Error::ModuleError("`secret_key` not found".to_string())
+                        })?,
+                        token,
+                    });
+                }
+                FsOptions::S3 {
+                    bucket: bucket
+                        .ok_or_else(|| Error::ModuleError("`bucket` not found".to_string()))?,
+                    credential,
+                    endpoint,
+                    region,
+                    sign_payload,
+                    checksum,
+                }
+            }
+        };
+        let mut options = DbOption::with_path(
+            path,
+            descs[primary_key_index].name.clone(),
+            primary_key_index,
+        );
+
+        if matches!(fs_option, FsOptions::S3 { .. }) {
+            let url = s3_url.ok_or_else(|| Error::ModuleError("`s3_url` not found".to_string()))?;
+            let url = Path::from_url_path(url)
+                .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
+            options = options
+                // TODO: We can add an option user to set all SSTables to use the same URL.
+                .level_path(0, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(1, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(2, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(3, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(4, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(5, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(6, url, fs_option.clone())
+                .unwrap();
         }
         let executor = aux.unwrap().executor.clone();
         let database = aux.unwrap().executor.block_on(async {
-            let options = DbOption::with_path(
-                Path::from_filesystem_path("./db_path/tonbo").unwrap(),
-                descs[primary_key_index].name.clone(),
-                primary_key_index,
-            );
-
             DB::with_schema(options, executor, descs.clone(), primary_key_index)
                 .await
                 .map_err(|err| Error::ModuleError(err.to_string()))
         })?;
 
         Ok((
-            format!("CREATE TABLE tonbo({})", fields.join(", ")),
+            schema.unwrap(),
             Self {
                 base: ffi::sqlite3_vtab::default(),
                 state: aux.unwrap().clone(),
@@ -317,6 +421,7 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 }
 
+// TODO: Value Cast
 fn value_trans(value: ValueRef<'_>, _ty: &Datatype, is_nullable: bool) -> Arc<dyn Any> {
     match value {
         ValueRef::Null => {
@@ -454,27 +559,82 @@ fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn type_trans(ty: &DataType) -> Datatype {
+    match ty {
+        DataType::Int8(_) => Datatype::Int8,
+        DataType::Int16 | DataType::SmallInt(_) => Datatype::Int16,
+        DataType::Int(_) | DataType::Int32 | DataType::Integer(_) => Datatype::Int32,
+        DataType::Int64 | DataType::BigInt(_) => Datatype::Int64,
+        DataType::UnsignedInt(_) | DataType::UInt32 | DataType::UnsignedInteger(_) => {
+            Datatype::UInt32
+        }
+        DataType::UInt8 | DataType::UnsignedInt8(_) => Datatype::UInt8,
+        DataType::UInt16 => Datatype::UInt16,
+        DataType::UInt64 | DataType::UnsignedBigInt(_) => Datatype::UInt64,
+        DataType::Bool | DataType::Boolean => Datatype::Boolean,
+        DataType::Bytes(_) => Datatype::Bytes,
+        DataType::Varchar(_) => Datatype::String,
+        _ => todo!(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use rusqlite::Connection;
+    use std::fs;
 
     #[test]
     fn test_load_module() -> rusqlite::Result<()> {
+        let _ = fs::create_dir_all("./db_path/test");
+
         let db = Connection::open_in_memory()?;
         super::load_module(&db)?;
 
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-                    id='int primary key',
-                    name='varchar nullable',
-                    like='int nullable'
-                    );",
+                    create_sql='create table tonbo(id bigint primary key, name varchar, like bigint)',
+                    path = './db_path/test',
+            );",
         )?;
         db.execute(
             "INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', 0)",
             [],
         )?;
         let mut stmt = db.prepare("SELECT * FROM tonbo;")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            println!("{:#?}", row);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_module_on_s3() -> rusqlite::Result<()> {
+        let _ = fs::create_dir_all("./db_path/test_s3");
+
+        let db = Connection::open_in_memory()?;
+        super::load_module(&db)?;
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+                    create_sql='create table tonbo(id bigint primary key, name varchar, like bigint)',
+                    path = './db_path/test_s3',
+                    bucket = 'data',
+                    key_id = 'user',
+                    secret_key = 'password',
+                    endpoint = 'http://localhost:9000',
+            );",
+        )?;
+        let num = 100000;
+        for i in 0..num {
+            db.execute(
+                &format!("INSERT INTO tonbo (id, name, like) VALUES ({i}, 'lol', {i})"),
+                [],
+            )?;
+        }
+
+        let mut stmt = db.prepare("SELECT * FROM tonbo limit 10;")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             println!("{:#?}", row);
