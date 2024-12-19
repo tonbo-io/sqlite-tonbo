@@ -1,24 +1,25 @@
 use crate::executor::{BlockOnExecutor, SQLiteExecutor};
-use crate::utils::{parse_type, set_result, type_trans, value_trans};
+use crate::utils::type_trans;
+use crate::utils::{set_result, value_trans};
 use flume::{Receiver, Sender};
-use fusio::path::Path;
-use fusio_dispatch::FsOptions;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
-use rusqlite::vtab::{parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind, ValueIter, Values};
-use rusqlite::{ffi, vtab, Connection, Error};
-use sqlparser::ast::{ColumnOption, DataType, Statement};
+use rusqlite::vtab::{
+    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind,
+    ValueIter, Values,
+};
+use rusqlite::{ffi, vtab, Error};
+use sqlparser::ast::ColumnOption;
+use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
-use std::any::Any;
 use std::collections::Bound;
 use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tonbo::executor::Executor;
-use tonbo::record::runtime::Datatype;
-use tonbo::record::{Column, ColumnDesc, DynRecord, Record};
-use tonbo::{DbOption, DB};
+use tonbo::record::{Column, DynRecord};
+use tonbo_net_client::client::TonboClient;
 
 pub struct DbState {
     executor: SQLiteExecutor,
@@ -35,15 +36,19 @@ impl DbState {
 #[repr(C)]
 pub struct TonboTable {
     base: ffi::sqlite3_vtab,
-    state: Arc<DbState>,
-    database: Arc<DB<DynRecord, SQLiteExecutor>>,
-    primary_key_index: usize,
-    column_desc: Vec<ColumnDesc>,
+    descs: Vec<tonbo::record::ColumnDesc>,
+    pk_index: usize,
+    req_tx: Sender<Request>,
 }
 
-enum FsType {
-    Local,
-    S3,
+enum Request {
+    Scan {
+        lower: Bound<Column>,
+        upper: Bound<Column>,
+        tuple_tx: Sender<Option<DynRecord>>,
+    },
+    Insert(DynRecord),
+    Remove(Column),
 }
 
 impl TonboTable {
@@ -54,38 +59,26 @@ impl TonboTable {
         _: bool,
     ) -> rusqlite::Result<(String, Self)> {
         let dialect = MySqlDialect {};
+        let mut addr = None;
+        let mut table_name = None;
+        let mut create_sql = None;
         let mut primary_key_index = None;
         let mut descs = Vec::new();
 
-        let mut schema = None;
-        let mut fs_option = None;
-        // Local
-        let mut path = None;
-        // S3
-        let mut s3_url = None;
-        let mut bucket = None;
-        let mut key_id = None;
-        let mut secret_key = None;
-        let mut token = None;
-        let mut endpoint = None;
-        let mut region = None;
-        let mut sign_payload = None;
-        let mut checksum = None;
-
         let args = &args[3..];
-        for (i, c_slice) in args.iter().enumerate() {
+        for c_slice in args.iter() {
             let (param, value) = vtab::parameter(c_slice)?;
             match param {
                 "create_sql" => {
-                    if schema.is_some() {
+                    if create_sql.is_some() {
                         return Err(Error::ModuleError("`create_sql` duplicate".to_string()));
                     }
-                    schema = Some(value.to_string());
+                    create_sql = Some(value.to_string());
                     if let Statement::CreateTable(create_table) =
                         &Parser::parse_sql(&dialect, value)
                             .map_err(|err| Error::ModuleError(err.to_string()))?[0]
                     {
-                        for column_def in create_table.columns.iter() {
+                        for (i, column_def) in create_table.columns.iter().enumerate() {
                             let name = column_def.name.value.to_ascii_lowercase();
                             let datatype = type_trans(&column_def.data_type);
                             let mut is_not_nullable = column_def
@@ -111,7 +104,7 @@ impl TonboTable {
                                 is_not_nullable = true;
                                 primary_key_index = Some(i)
                             }
-                            descs.push(ColumnDesc {
+                            descs.push(tonbo::record::ColumnDesc {
                                 datatype,
                                 is_nullable: !is_not_nullable,
                                 name,
@@ -123,25 +116,18 @@ impl TonboTable {
                         )));
                     }
                 }
-                "fs" => match value {
-                    "local" => fs_option = Some(FsType::Local),
-                    "s3" => fs_option = Some(FsType::S3),
-                    _ => {
-                        return Err(Error::ModuleError(format!(
-                            "unrecognized fs type '{param}'"
-                        )))
+                "addr" => {
+                    if addr.is_some() {
+                        return Err(Error::ModuleError("`addr` duplicate".to_string()));
                     }
-                },
-                "s3_url" => s3_url = Some(value.to_string()),
-                "key_id" => key_id = Some(value.to_string()),
-                "secret_key" => secret_key = Some(value.to_string()),
-                "token" => token = Some(value.to_string()),
-                "bucket" => bucket = Some(value.to_string()),
-                "path" => path = Some(value.to_string()),
-                "endpoint" => endpoint = Some(value.to_string()),
-                "region" => region = Some(value.to_string()),
-                "sign_payload" => sign_payload = parse_boolean(value),
-                "checksum" => checksum = parse_boolean(value),
+                    addr = Some(value.to_string());
+                }
+                "table_name" => {
+                    if table_name.is_some() {
+                        return Err(Error::ModuleError("`table_name` duplicate".to_string()));
+                    }
+                    table_name = Some(value.to_string());
+                }
                 _ => {
                     return Err(Error::ModuleError(format!(
                         "unrecognized parameter '{param}'"
@@ -149,92 +135,59 @@ impl TonboTable {
                 }
             }
         }
-        let primary_key_index = primary_key_index.ok_or_else(|| {
-            Error::ModuleError("the primary key must exist and only one is allowed".to_string())
+        let pk_index = primary_key_index.ok_or_else(|| {
+            Error::ModuleError("primary key not found on `create_sql`".to_string())
         })?;
-        if descs[primary_key_index].datatype != Datatype::Int64 {
-            return Err(Error::ModuleError(
-                "the primary key must be of `bigint` type".to_string(),
-            ));
-        }
-        let path = Path::from_filesystem_path(
-            path.ok_or_else(|| Error::ModuleError("`path` not found".to_string()))?,
-        )
-        .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
-        let fs_option = match fs_option.unwrap_or(FsType::Local) {
-            FsType::Local => FsOptions::Local,
-            FsType::S3 => {
-                let mut credential = None;
+        let table_name =
+            table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
+        let mut client = aux.unwrap().executor.block_on(async {
+            let client = TonboClient::connect(
+                addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))?,
+                table_name,
+                descs.clone(),
+                pk_index,
+            )
+            .await
+            .map_err(|err| Error::ModuleError(err.to_string()))?;
 
-                if key_id.is_some() || secret_key.is_some() || token.is_some() {
-                    credential = Some(fusio::remotes::aws::AwsCredential {
-                        key_id: key_id
-                            .ok_or_else(|| Error::ModuleError("`key_id` not found".to_string()))?,
-                        secret_key: secret_key.ok_or_else(|| {
-                            Error::ModuleError("`secret_key` not found".to_string())
-                        })?,
-                        token,
-                    });
-                }
-                FsOptions::S3 {
-                    bucket: bucket
-                        .ok_or_else(|| Error::ModuleError("`bucket` not found".to_string()))?,
-                    credential,
-                    endpoint,
-                    region,
-                    sign_payload,
-                    checksum,
+            Ok::<TonboClient, rusqlite::Error>(client)
+        })?;
+        let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
+        aux.unwrap().executor.spawn(async move {
+            while let Ok(req) = req_rx.recv() {
+                match req {
+                    Request::Scan {
+                        lower,
+                        upper,
+                        tuple_tx,
+                    } => {
+                        let mut stream = client.scan(lower, upper).await.unwrap();
+
+                        while let Some(result) = stream.next().await {
+                            let entry = result.unwrap();
+                            let _ = tuple_tx.send(Some(entry));
+                        }
+                        let _ = tuple_tx.send(None);
+                    }
+                    Request::Insert(record) => client.insert(record).await.unwrap(),
+                    Request::Remove(key) => client.remove(key).await.unwrap(),
                 }
             }
-        };
-        let mut options = DbOption::with_path(
-            path,
-            descs[primary_key_index].name.clone(),
-            primary_key_index,
-        );
-
-        if matches!(fs_option, FsOptions::S3 { .. }) {
-            let url = s3_url.ok_or_else(|| Error::ModuleError("`s3_url` not found".to_string()))?;
-            let url = Path::from_url_path(url)
-                .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
-            options = options
-                // TODO: We can add an option user to set all SSTables to use the same URL.
-                .level_path(0, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(1, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(2, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(3, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(4, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(5, url.clone(), fs_option.clone())
-                .unwrap()
-                .level_path(6, url, fs_option.clone())
-                .unwrap();
-        }
-        let executor = aux.unwrap().executor.clone();
-        let database = aux.unwrap().executor.block_on(async {
-            DB::with_schema(options, executor, descs.clone(), primary_key_index)
-                .await
-                .map_err(|err| Error::ModuleError(err.to_string()))
-        })?;
+        });
 
         Ok((
-            schema.unwrap(),
+            create_sql.ok_or_else(|| Error::ModuleError("`create_sql` not found".to_string()))?,
             Self {
                 base: ffi::sqlite3_vtab::default(),
-                state: aux.unwrap().clone(),
-                database: Arc::new(database),
-                primary_key_index,
-                column_desc: descs,
+                req_tx,
+                descs,
+                pk_index,
             },
         ))
     }
 
     fn _remove(&mut self, pk: i64) -> Result<(), Error> {
-        let desc = &self.column_desc[self.primary_key_index];
+        let desc: &tonbo::record::ColumnDesc = &self.descs[self.pk_index];
         let value = Column::new(
             desc.datatype,
             desc.name.clone(),
@@ -242,19 +195,16 @@ impl TonboTable {
             desc.is_nullable,
         );
 
-        self.state
-            .executor
-            .block_on(async { self.database.remove(value).await })
-            .map_err(|err| Error::ModuleError(err.to_string()))?;
+        self.req_tx.send(Request::Remove(value)).unwrap();
         Ok(())
     }
 
     fn _insert(&mut self, args: ValueIter) -> Result<i64, Error> {
         let mut id = None;
-        let mut values = Vec::with_capacity(self.column_desc.len());
+        let mut values = Vec::with_capacity(self.descs.len());
 
-        for (i, (desc, value)) in self.column_desc.iter().zip(args).enumerate() {
-            if i == self.primary_key_index {
+        for (i, (desc, value)) in self.descs.iter().zip(args).enumerate() {
+            if i == self.pk_index {
                 id = Some(value);
             }
             values.push(Column::new(
@@ -265,14 +215,9 @@ impl TonboTable {
             ));
         }
 
-        self.state
-            .executor
-            .block_on(async {
-                self.database
-                    .insert(DynRecord::new(values, self.primary_key_index))
-                    .await
-            })
-            .map_err(|err| Error::ModuleError(err.to_string()))?;
+        self.req_tx
+            .send(Request::Insert(DynRecord::new(values, self.pk_index)))
+            .unwrap();
         Ok(id.unwrap().as_i64()?)
     }
 }
@@ -296,40 +241,10 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
-        let (req_tx, req_rx): (
-            Sender<(
-                Bound<<DynRecord as Record>::Key>,
-                Bound<<DynRecord as Record>::Key>,
-            )>,
-            _,
-        ) = flume::bounded(1);
-        let (tuple_tx, tuple_rx): (Sender<Option<(Vec<Column>, usize)>>, _) = flume::bounded(10);
-        let database = self.database.clone();
-
-        self.state.executor.spawn(async move {
-            while let Ok((lower, upper)) = req_rx.recv() {
-                let transaction = database.transaction().await;
-
-                let mut stream = transaction
-                    .scan((lower.as_ref(), upper.as_ref()))
-                    .take()
-                    .await
-                    .unwrap();
-
-                while let Some(result) = stream.next().await {
-                    let entry = result.unwrap();
-                    if let Some(value) = entry.value() {
-                        let _ = tuple_tx.send(Some((value.columns, value.primary_index)));
-                    }
-                }
-                let _ = tuple_tx.send(None);
-            }
-        });
-
         Ok(RecordCursor {
             base: ffi::sqlite3_vtab_cursor::default(),
-            req_tx,
-            tuple_rx,
+            req_tx: self.req_tx.clone(),
+            tuple_rx: None,
             buf: None,
             _p: Default::default(),
         })
@@ -356,12 +271,9 @@ impl CreateVTab<'_> for TonboTable {
 pub struct RecordCursor<'vtab> {
     /// Base class. Must be first
     base: ffi::sqlite3_vtab_cursor,
-    req_tx: Sender<(
-        Bound<<DynRecord as Record>::Key>,
-        Bound<<DynRecord as Record>::Key>,
-    )>,
-    tuple_rx: Receiver<Option<(Vec<Column>, usize)>>,
-    buf: Option<(Vec<Column>, usize)>,
+    req_tx: Sender<Request>,
+    tuple_rx: Option<Receiver<Option<DynRecord>>>,
+    buf: Option<DynRecord>,
     _p: PhantomData<&'vtab TonboTable>,
 }
 
@@ -404,16 +316,28 @@ impl UpdateVTab<'_> for TonboTable {
 
 unsafe impl VTabCursor for RecordCursor<'_> {
     fn filter(&mut self, _: c_int, _: Option<&str>, _: &Values<'_>) -> rusqlite::Result<()> {
+        let (tuple_tx, tuple_rx) = flume::bounded(5);
+
         self.req_tx
-            .send((Bound::Unbounded, Bound::Unbounded))
+            .send(Request::Scan {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                tuple_tx,
+            })
             .unwrap();
+        self.tuple_rx = Some(tuple_rx);
         self.next()?;
 
         Ok(())
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
-        self.buf = self.tuple_rx.recv().unwrap();
+        self.buf = self
+            .tuple_rx
+            .as_mut()
+            .expect("`filter` was not called")
+            .recv()
+            .unwrap();
 
         Ok(())
     }
@@ -423,35 +347,33 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> rusqlite::Result<()> {
-        if let Some((columns, _)) = &self.buf {
-            set_result(ctx, &columns[i as usize])?;
+        if let Some(record) = &self.buf {
+            set_result(ctx, &record.columns()[i as usize])?;
         }
         Ok(())
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        let (columns, pk_i) = self.buf.as_ref().unwrap();
+        let record = self.buf.as_ref().unwrap();
 
-        Ok(*columns[*pk_i].value.downcast_ref().unwrap())
+        Ok(*record.primary_column().value.downcast_ref().unwrap())
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use rusqlite::Connection;
-    use std::fs;
 
     #[test]
     fn test_load_module() -> rusqlite::Result<()> {
-        let _ = fs::create_dir_all("./db_path/test");
-
         let db = Connection::open_in_memory()?;
         crate::load_module(&db)?;
 
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-                    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
-                    path = './db_path/test',
+                    create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
+                    table_name ='tonbo',
+                    addr = 'http://[::1]:50051',
             );",
         )?;
         for i in 0..3 {
@@ -493,40 +415,6 @@ pub(crate) mod tests {
         let mut stmt = db.prepare("SELECT * FROM tonbo where id = ?1;")?;
         let mut rows = stmt.query(["2"])?;
         assert!(rows.next()?.is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_load_module_on_s3() -> rusqlite::Result<()> {
-        let _ = fs::create_dir_all("./db_path/test_s3");
-
-        let db = Connection::open_in_memory()?;
-        crate::load_module(&db)?;
-
-        db.execute_batch(
-            "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-                    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
-                    path = './db_path/test_s3',
-                    bucket = 'data',
-                    key_id = 'user',
-                    secret_key = 'password',
-                    endpoint = 'http://localhost:9000',
-            );",
-        )?;
-        let num = 100000;
-        for i in 0..num {
-            db.execute(
-                &format!("INSERT INTO tonbo (id, name, like) VALUES ({i}, 'lol', {i})"),
-                [],
-            )?;
-        }
-
-        let mut stmt = db.prepare("SELECT * FROM tonbo limit 10;")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            println!("{:#?}", row);
-        }
 
         Ok(())
     }
